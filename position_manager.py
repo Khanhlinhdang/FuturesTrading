@@ -10,14 +10,14 @@ class PositionSide(Enum):
 
 
 class PositionType(Enum):
-    SPOT = "spot"
-    FUTURES = "futures"
+    SPOT = "SPOT"
+    FUTURES = "FUTURES"
 
 
 class PositionStatus(Enum):
-    OPEN = "open"
-    CLOSED = "closed"
-    LIQUIDATED = "liquidated"
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    LIQUIDATED = "LIQUIDATED"
 
 maint_lookup_table = [
     (     50_000,  0.4,           0),
@@ -54,6 +54,7 @@ class Position:
         self.entry_price = entry_price
         self.max_price = entry_price
         self.min_price = entry_price
+        self.current_price = entry_price
         self.quantity = quantity
         self.side = side # LONG or SHORT
         self.type = position_type  # spot or futures
@@ -199,7 +200,7 @@ class PositionManager:
             maintenance_margin = position_value * self.maintenance_margin_rate
             liquidation_price = (bankruptcy_price * position_size - maintenance_margin - fee) / position_size
         
-        return liquidation_price
+        return round(liquidation_price, 4)
 
 
     def calculate_open_fee(self, position_size: float, is_taker: bool = True, leverage: float = 1.0) -> float:
@@ -217,7 +218,7 @@ class PositionManager:
         fee_rate = self.taker_fee if is_taker else self.maker_fee
         # Apply fee to the leveraged position size
         leveraged_position_size = position_size * leverage
-        return leveraged_position_size * fee_rate
+        return round(leveraged_position_size * fee_rate,2)
 
     def calculate_close_fee(self,position: Position, current_price: float,is_taker: bool = True) -> float:
         """
@@ -237,7 +238,7 @@ class PositionManager:
         close_position_size = quantity * current_price
         # Apply fee to the leveraged closing position size
         leveraged_close_position_size = close_position_size * leverage
-        return leveraged_close_position_size * fee_rate
+        return round(leveraged_close_position_size * fee_rate, 2)
 
 
     def open_position(
@@ -320,6 +321,8 @@ class PositionManager:
             
         # Update the stop loss
         position.stop_loss = new_stop_loss
+
+        self.update_position(position, position.current_price)
         
         # Recalculate risk-reward ratio if take profit is set
         if position.take_profit:
@@ -341,7 +344,7 @@ class PositionManager:
             
         # Update the take profit
         position.take_profit = new_take_profit
-        
+        self.update_position(position, position.current_price)
         # Recalculate risk-reward ratio if stop loss is set
         if position.stop_loss:
             position.risk_reward_ratio = self.calculate_position_risk_reward(position)
@@ -429,14 +432,7 @@ class PositionManager:
             
         return False
 
-    def calculate_pnl(
-        self, 
-        entry_price: float, 
-        exit_price: float, 
-        quantity: float, 
-        side: str,
-        leverage: float = 1.0
-    ) -> float:
+    def calculate_pnl(self, position: Position,current_price=None) -> float:
         """
         Calculate the raw profit/loss for a position without fees
         
@@ -450,15 +446,17 @@ class PositionManager:
         Returns:
             The raw PnL value
         """
+        entry_price, quantity, side, leverage = position.entry_price, position.quantity, position.side, position.leverage
+        
+        if not current_price:
+            current_price = position.current_price
         if side == PositionSide.LONG:
-            pnl = (exit_price - entry_price) * quantity
+            pnl = (current_price - entry_price) * quantity
         else:  # SHORT
-            pnl = (entry_price - exit_price) * quantity
-            
+            pnl = (entry_price - current_price) * quantity
         # Apply leverage for futures positions
         pnl = pnl * leverage
-            
-        return pnl
+        return round(pnl, 2)
 
     def calculate_pnl_with_fees(
         self, 
@@ -483,8 +481,8 @@ class PositionManager:
             The PnL value including fees
         """
         # Get the raw PnL
-        entry_price, quantity, side, leverage = position.entry_price, position.quantity, position.side, position.leverage
-        pnl = self.calculate_pnl(entry_price, exit_price, quantity, side, leverage)
+        entry_price, quantity, leverage = position.entry_price, position.quantity, position.leverage
+        pnl = self.calculate_pnl(position,exit_price)
         
         # If fees are not provided, calculate them
         if open_fee is None:
@@ -505,7 +503,7 @@ class PositionManager:
         # Subtract fees from the PnL
         pnl_with_fees = pnl - open_fee - close_fee
         
-        return pnl_with_fees
+        return round(pnl_with_fees, 2)
 
     def calculate_pnl_percentage(
         self, 
@@ -543,44 +541,33 @@ class PositionManager:
         fees_percentage = (open_fee + close_fee) / (entry_price * 1.0)  # Assuming quantity = 1.0 for simplicity
         pnl_percentage = raw_pnl_percentage - fees_percentage
         
-        return pnl_percentage * 100  # Convert to percentage
+        return round(pnl_percentage * 100, 2)     # Convert to percentage
 
-    def calculate_unrealized_pnl(
-        self, 
-        position: Position, 
-        current_price: float,
-        open_fee: float = None
-    ) -> float:
+    def calculate_unrealized_pnl(self, position: Position, current_price: float,open_fee: float = None) -> float:
         """
-        Calculate the unrealized profit/loss for a position
-        
+        Calculate the unrealized profit and loss (PnL) for a given position based on the current price.
         Args:
-            position: The position object
-            current_price: The current market price
-            open_fee: Optional override for open fee
-            
+            position (Position): The trading position for which to calculate the unrealized PnL.
+            current_price (float): The current market price of the asset.
+            open_fee (float, optional): The fee incurred when opening the position. If not provided, 
+                the position's `open_fee` attribute will be used.
         Returns:
-            The unrealized PnL value
+            float: The calculated unrealized PnL for the position.
+        Notes:
+            - If the position is not open (`PositionStatus.OPEN`), the unrealized PnL will be 0.0.
+            - The unrealized PnL is adjusted by subtracting the open fee if provided.
+            - Updates the position's `unrealized_pnl`, `max_price`, and `min_price` attributes.
+            - Also updates the position's run-up and drawdown metrics using the current price.
         """
-        
         # Check if the position is still open
         if position.status != PositionStatus.OPEN:
             return 0.0
-            
-        # Use provided leverage or position's leverage
-        actual_leverage = position.leverage
         
         # Use provided open_fee or position's open_fee
         actual_open_fee = open_fee if open_fee is not None else position.open_fee
         
         # Calculate the unrealized PnL
-        unrealized_pnl = self.calculate_pnl(
-            position.entry_price, 
-            current_price, 
-            position.quantity, 
-            position.side,
-            actual_leverage
-        )
+        unrealized_pnl = self.calculate_pnl(position,current_price)
         
         # Subtract the open fee if provided
         if actual_open_fee:
@@ -599,26 +586,26 @@ class PositionManager:
         self.calculate_position_run_up(position, current_price)
         self.calculate_position_drawdown(position, current_price)
         
-        return unrealized_pnl
+        return round(unrealized_pnl, 2)
 
-    def calculate_unrealized_pnl_percentage(
-        self, 
+    def calculate_unrealized_pnl_percentage(self, 
         position: Position, 
         current_price: float,
         open_fee: float = None,
-        close_fee: float = None
-    ) -> float:
+        close_fee: float = None) -> float:
         """
-        Calculate the unrealized profit/loss percentage for a position
-        
+        Calculate the unrealized profit and loss (PnL) percentage for a given position.
+
         Args:
-            position: The position object
-            current_price: The current market price
-            open_fee: Optional override for open fee
-            close_fee: Estimated fee for closing the position
-            
+            position (Position): The trading position for which the unrealized PnL percentage is calculated.
+            current_price (float): The current market price of the asset.
+            open_fee (float, optional): The fee incurred when opening the position. If not provided, 
+                the position's `open_fee` will be used.
+            close_fee (float, optional): The fee estimated for closing the position. If not provided, 
+                it will be calculated using the `calculate_close_fee` method.
+
         Returns:
-            The unrealized PnL percentage value
+            float: The unrealized PnL percentage. Returns 0.0 if the position is not open.
         """
         # Check if the position is still open
         if position.status != PositionStatus.OPEN:
@@ -645,7 +632,7 @@ class PositionManager:
             actual_open_fee if actual_open_fee else 0.0,
             estimated_close_fee
         )
-        return unrealized_pnl_percentage
+        return round(unrealized_pnl_percentage, 2)
 
     def calculate_position_run_up(self, position: Position, current_price: float) -> float:
         """
@@ -665,17 +652,17 @@ class PositionManager:
         """
         # Calculate the current unrealized PnL
         current_pnl = self.calculate_pnl(
-            position.entry_price, current_price, position.quantity, position.side, position.leverage
+            position, current_price
         )
         # For LONG positions, max price gives max profit
         # For SHORT positions, min price gives max profit
         if position.side == PositionSide.LONG:
             max_pnl = self.calculate_pnl(
-                position.entry_price, position.max_price, position.quantity, position.side, position.leverage
+                position, position.max_price
             )
         else:  # SHORT
             max_pnl = self.calculate_pnl(
-                position.entry_price, position.min_price, position.quantity, position.side, position.leverage
+                position, position.min_price
             )
         # Run-up is the highest profit point
         position.run_up = max(max_pnl, current_pnl)
@@ -696,18 +683,18 @@ class PositionManager:
             (negative value) for the position.
         """
         # Calculate the current unrealized PnL
-        current_pnl = self.calculate_pnl(
-            position.entry_price, current_price, position.quantity, position.side, position.leverage
-        )
+        position.current_price = current_price
+        current_pnl = self.calculate_pnl(position,current_price)
+
         # For LONG positions, min price gives max loss
         # For SHORT positions, max price gives max loss
         if position.side == PositionSide.LONG:
             min_pnl = self.calculate_pnl(
-                position.entry_price, position.min_price, position.quantity, position.side, position.leverage
+                position, position.min_price
             )
         else:  # SHORT
             min_pnl = self.calculate_pnl(
-                position.entry_price, position.max_price, position.quantity, position.side, position.leverage
+                position, position.max_price
             )
         # Drawdown is the lowest loss point (negative value)
         position.drawdown = min(min_pnl, current_pnl)
@@ -755,13 +742,22 @@ class PositionManager:
         
         effective_leverage = current_position_value / current_equity
         
-        return effective_leverage
+        return round(effective_leverage, 2)
 
     def calculate_position_risk_reward(self, position: Position) -> float:
         """
-        Calculate the risk-reward ratio for a position
-        
-        Risk-reward ratio = Potential Reward / Potential Risk
+        Calculate the risk-reward ratio for a given trading position.
+        This method computes the potential risk and reward based on the entry price,
+        stop loss, and take profit levels of the position. It also considers the 
+        position side (LONG or SHORT) to determine the appropriate calculations.
+        Args:
+            position (Position): The trading position containing the entry price, 
+                                 stop loss, take profit, and side (LONG or SHORT).
+        Returns:
+            float: The calculated risk-reward ratio.
+        Raises:
+            ValueError: If the potential risk is zero (entry price equals stop loss),
+                        which would result in a division by zero.
         """
         # Calculate potential risk and reward based on position side
         entry_price = position.entry_price
@@ -781,19 +777,26 @@ class PositionManager:
             
         risk_reward_ratio = potential_reward / potential_risk
         
-        return risk_reward_ratio
+        return round(risk_reward_ratio, 2)
 
     def calculate_risk_metrics(self, position: Position,current_price) -> Dict:
         """
-        Calculate various risk metrics for a position
-        
-        Returns a dictionary with the following metrics:
-        - unrealized_pnl
-        - unrealized_pnl_percentage
-        - drawdown
-        - run_up
-        - risk_reward_ratio
-        - liquidation_distance (for futures positions)
+        Calculate and return risk metrics for a given trading position.
+        This method updates the position with the current price and computes
+        various risk-related metrics such as unrealized profit and loss (PnL),
+        drawdown, run-up, risk-reward ratio, and liquidation distance.
+        Args:
+            position (Position): The trading position object containing details
+                about the current position.
+            current_price (float): The current market price of the asset.
+        Returns:
+            Dict: A dictionary containing the following risk metrics:
+                - "unrealized_pnl" (float): The unrealized profit or loss.
+                - "unrealized_pnl_percentage" (float): The unrealized PnL as a percentage.
+                - "drawdown" (float): The maximum observed loss from a peak.
+                - "run_up" (float): The maximum observed gain from a trough.
+                - "risk_reward_ratio" (float): The ratio of potential reward to risk.
+                - "liquidation_distance" (float): The distance to the liquidation price.
         """
         # Calculate the risk metrics
         # Compile the metrics
@@ -811,18 +814,30 @@ class PositionManager:
 
     def update_position(self, position: Position, current_price: float) -> Position:
         """
-        Update a position with the current market price
-        
-        This calculates and updates all dynamic fields of the position like:
-        - unrealized PnL
-        - max/min prices
-        - run-up
-        - drawdown
+        Updates the details of a given trading position based on the current market price.
+        Args:
+            position (Position): The trading position to update. Must be an instance of the Position class.
+            current_price (float): The current market price of the asset.
+        Returns:
+            Position: The updated trading position with recalculated attributes.
+        Updates:
+            - `current_price`: Sets the current price of the position.
+            - `unrealized_pnl`: Recalculates the unrealized profit and loss.
+            - `unrealized_pnl_percentage`: Recalculates the unrealized profit and loss as a percentage.
+            - `max_price`: Updates the maximum price reached by the position.
+            - `min_price`: Updates the minimum price reached by the position.
+            - `run_up`: Recalculates the position's run-up (maximum gain from entry price).
+            - `drawdown`: Recalculates the position's drawdown (maximum loss from entry price).
+            - `liquidation_distance`: For leveraged futures positions, calculates the percentage distance to the liquidation price.
+        Notes:
+            - If the position is not open (`PositionStatus.OPEN`), it is returned without modification.
+            - For futures positions with leverage greater than 1, the liquidation distance is calculated based on the position's side (LONG or SHORT).
         """
         # Check if the position is still open
         if position.status != PositionStatus.OPEN:
             return position
-            
+        # Update the current price
+        position.current_price = current_price
         # Update the unrealized PnL
         position.unrealized_pnl = self.calculate_unrealized_pnl(position, current_price)
         position.unrealized_pnl_percentage = self.calculate_unrealized_pnl_percentage(position, current_price)
@@ -847,33 +862,40 @@ class PositionManager:
 
     def auto_track_position(self, position: Position, current_price: float) -> Dict:
         """
-        Automatically track and manage a position based on current price
-        
-        This function checks for:
-        - Stop loss hit
-        - Take profit hit
-        - Liquidation price hit (for futures)
-        
-        Returns a dictionary with action taken and updated position
+        Automatically tracks the status of a trading position and determines the appropriate action 
+        based on the current price and position parameters.
+
+        Args:
+            position (Position): The trading position to be tracked.
+            current_price (float): The current market price of the asset.
+
+        Returns:
+            Dict: A dictionary containing the action taken and the updated position object. 
+                  Possible actions include:
+                  - "none": No action taken as the position is not open.
+                  - "stop_loss": Position closed due to stop loss being hit.
+                  - "take_profit": Position closed due to take profit being hit.
+                  - "liquidation": Position liquidated due to hitting the liquidation price.
+                  - "tracking": Position is still being tracked with no action taken.
+
+        Notes:
+            - The function updates the position details based on the current price.
+            - For futures positions, it checks if the liquidation price is hit and handles it accordingly.
+            - Realized PnL is calculated as a full loss of margin in case of liquidation.
         """
-        
         # Check if the position is still open
         if position.status != PositionStatus.OPEN:
             return {"action": "none", "position": position}
-            
         # Update the position
         self.update_position(position, current_price)
-        
         # Check for stop loss hit
         if self.check_stop_loss_hit(position, current_price):
             self.close_position(position, current_price)
             return {"action": "stop_loss", "position": position}
-            
         # Check for take profit hit
         if self.check_take_profit_hit(position, current_price):
             self.close_position(position, current_price)
             return {"action": "take_profit", "position": position}
-            
         # Check for liquidation price hit (for futures)
         if position.type == PositionType.FUTURES and position.liquidation_price:
             if (position.side == PositionSide.LONG and current_price <= position.liquidation_price) or \
@@ -882,14 +904,45 @@ class PositionManager:
                 position.closed_time = datetime.now()
                 position.realized_pnl = -position.position_size / position.leverage  # Full loss of margin
                 return {"action": "liquidation", "position": position}
-                
         return {"action": "tracking", "position": position}
 
     def get_position_summary(self, position: Position, current_price: float = None) -> Dict:
         """
-        Get a summary of a position
-        
-        Returns a dictionary with key information about the position
+        Generates a summary of the given position, including its details and calculated metrics.
+        Args:
+            position (Position): The position object containing details about the trade.
+            current_price (float, optional): The current market price of the asset. Defaults to None.
+        Returns:
+            Dict: A dictionary containing the position summary with the following keys:
+                - id (str): The unique identifier of the position.
+                - exchange (str): The exchange where the position is held.
+                - symbol (str): The trading symbol of the asset.
+                - side (str): The side of the position (e.g., 'long' or 'short').
+                - type (str): The type of position (e.g., 'market' or 'limit').
+                - entry_price (float): The price at which the position was entered.
+                - quantity (float): The quantity of the asset in the position.
+                - position_size (float): The size of the position in terms of value.
+                - leverage (float): The leverage used for the position.
+                - status (str): The current status of the position (e.g., 'open', 'closed', 'liquidated').
+                - entry_time (datetime): The timestamp when the position was opened.
+                - closed_time (datetime): The timestamp when the position was closed (if applicable).
+                - stop_loss (float): The stop-loss price for the position.
+                - take_profit (float): The take-profit price for the position.
+                - liquidation_price (float): The liquidation price for the position.
+                - risk_reward_ratio (float): The risk-reward ratio of the position.
+                - open_fee (float): The fee incurred when opening the position.
+                - close_fee (float): The fee incurred when closing the position.
+                - current_price (float): The current market price of the asset (if provided).
+                - unrealized_pnl (float): The unrealized profit or loss of the position.
+                - unrealized_pnl_percentage (float): The unrealized profit or loss as a percentage.
+                - run_up (float): The maximum favorable price movement since the position was opened.
+                - drawdown (float): The maximum adverse price movement since the position was opened.
+                - realized_pnl (float): The realized profit or loss of the position (if applicable).
+        Notes:
+            - If the position is open and a current price is provided, the unrealized PnL and 
+              unrealized PnL percentage are recalculated based on the current price.
+            - If the position is closed or liquidated, the realized PnL is included, and unrealized 
+              PnL metrics are set to None.
         """
         # Prepare the summary
         summary = {
@@ -936,13 +989,15 @@ class PositionManager:
 
     def get_all_position_summary(self, current_price_map: Dict[str, float] = None) -> List[Dict]:
         """
-        Get a summary of all positions
-        
+        Retrieves a summary of all positions managed by the position manager.
         Args:
-            current_price_map: A dictionary mapping symbols to their current prices
-            
+            current_price_map (Dict[str, float], optional): A dictionary mapping 
+                symbols to their current prices. If provided, the current price 
+                for each position's symbol will be used in the summary. Defaults to None.
         Returns:
-            A list of position summaries
+            List[Dict]: A list of dictionaries, where each dictionary contains 
+                the summary of a position. The summary includes details such as 
+                the position's symbol, quantity, and other relevant information.
         """
         summaries = []
         
@@ -978,6 +1033,14 @@ btc_position = position_manager.open_position(
     take_profit=55000,
     is_taker=True
 )
-position_manager.update_position(btc_position, current_price=52000)
+
+
+# Cập nhật vị thế với giá hiện tại
+position_manager.update_position(btc_position, current_price=51000)
 # In ra thông tin vị thế
+position_manager.modify_position_stop_loss(btc_position, new_stop_loss=49000)
+position_manager.modify_position_take_profit(btc_position, new_take_profit=54000)
+print(position_manager.get_position_summary(btc_position))
+
+position_manager.update_position(btc_position, current_price=54000)
 print(position_manager.get_position_summary(btc_position))

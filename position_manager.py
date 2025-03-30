@@ -38,6 +38,7 @@ class Position:
         exchange: str,
         symbol: str,
         entry_price: float,
+        entry_time: float,
         quantity: float,
         side: PositionSide,
         position_type: PositionType,
@@ -47,8 +48,11 @@ class Position:
         open_fee: float = None,
         close_fee: float = None,
         id: str = None,
+        strategy_id: str = None,
+        total_capital: float = 0.0,
     ):
         self.id = id if id else str(uuid.uuid4())
+        self.strategy_id = strategy_id
         self.exchange = exchange
         self.symbol = symbol
         self.entry_price = entry_price
@@ -72,8 +76,9 @@ class Position:
         self.realized_pnl = 0.0
         self.realized_pnl_percentage = 0.0
         self.status = PositionStatus.OPEN
-        self.entry_time = datetime.now()
+        self.entry_time = entry_time
         self.closed_time = None
+        self.total_capital = total_capital
         self.open_fee = open_fee
         self.close_fee = close_fee
 
@@ -91,11 +96,30 @@ class PositionManager:
         maintenance_margin_rate: float = 0.005,
         taker_fee: float = 0.0004,
         maker_fee: float = 0.0002,
+        total_capital: float = 1000,
     ):
-        self.positions = {}
+        self.positions: Dict[str, Position] = {}
         self.maintenance_margin_rate = maintenance_margin_rate
         self.taker_fee = taker_fee
         self.maker_fee = maker_fee
+        self.total_capital = total_capital
+
+    def setup_variables(self, total_capital: float, maintenance_margin_rate: float, taker_fee: float, maker_fee: float):
+        """Set up the initial variables for the PositionManager"""
+        self.positions: Dict[str, Position] = {}
+        self.maintenance_margin_rate = maintenance_margin_rate
+        self.taker_fee = taker_fee
+        self.maker_fee = maker_fee
+        self.total_capital = total_capital
+
+    @property
+    def total_capital(self) -> float:
+        """Calculate the total capital available for trading"""
+        return self.balance
+    @total_capital.setter
+    def total_capital(self, value: float):
+        """Set the total capital available for trading"""
+        self.balance = value
 
     def calculate_recommended_capital_by_risk(self, position: Position, total_capital, risk_percentage=1):
         """
@@ -190,7 +214,6 @@ class PositionManager:
         position_value = position_size * entry_price
         initial_margin = position_value / leverage
         fee = position_value * self.taker_fee
-        
         if side == PositionSide.LONG:
             bankruptcy_price = entry_price - initial_margin / position_size
             maintenance_margin = position_value * self.maintenance_margin_rate
@@ -199,9 +222,7 @@ class PositionManager:
             bankruptcy_price = entry_price + initial_margin / position_size
             maintenance_margin = position_value * self.maintenance_margin_rate
             liquidation_price = (bankruptcy_price * position_size - maintenance_margin - fee) / position_size
-        
         return round(liquidation_price, 4)
-
 
     def calculate_open_fee(self, position_size: float, is_taker: bool = True, leverage: float = 1.0) -> float:
         """
@@ -246,6 +267,7 @@ class PositionManager:
         exchange: str,
         symbol: str,
         entry_price: float,
+        entry_time: float,
         quantity: float,
         side: PositionSide,
         position_type: PositionType,
@@ -254,6 +276,7 @@ class PositionManager:
         take_profit: float = None,
         is_taker: bool = True,
         id: str = None,
+        strategy_id: str = None,
     ) -> Position:
         """Open a new position"""
         # Validate the side
@@ -281,6 +304,7 @@ class PositionManager:
             exchange=exchange,
             symbol=symbol,
             entry_price=entry_price,
+            entry_time=entry_time,
             quantity=quantity,
             side=side,
             position_type=position_type,
@@ -288,8 +312,10 @@ class PositionManager:
             stop_loss=stop_loss,
             take_profit=take_profit,
             id=id,
+            strategy_id=strategy_id,
             open_fee=open_fee,
             close_fee=None,  # Will be calculated at close time
+            total_capital=self.total_capital
         )
         
         # Calculate liquidation price for futures positions
@@ -351,13 +377,13 @@ class PositionManager:
             
         return position
 
-    def close_position(self, position: Position, exit_price: float, is_taker: bool = True) -> Position:
+    def close_position(self, position: Position, exit_price: float, current_time: int, is_taker: bool = True) -> Position:
         """Close an existing position"""
         
         # Check if the position is already closed
         if position.status != PositionStatus.OPEN:
             raise ValueError(f"Position is already {position.status}")
-            
+        position.closed_time = current_time
         # Calculate closing fee
         position.close_fee = self.calculate_close_fee(
             position=position,
@@ -372,12 +398,12 @@ class PositionManager:
             open_fee=position.open_fee,
             close_fee=position.close_fee
         )
+        self.total_capital += position.realized_pnl
+        position.total_capital = self.total_capital + position.realized_pnl - position.open_fee - position.close_fee
         position.unrealized_pnl = 0.0  # Reset unrealized PnL on close
         position.unrealized_pnl_percentage = 0.0  # Reset unrealized PnL percentage on close
-
         # Update position status and closed time
         position.status = PositionStatus.CLOSED
-        position.closed_time = datetime.now()
         
         return position
 
@@ -575,16 +601,6 @@ class PositionManager:
             
         # Update the position's unrealized PnL
         position.unrealized_pnl = unrealized_pnl
-        
-        # Update max and min prices
-        if current_price > position.max_price:
-            position.max_price = current_price
-        if current_price < position.min_price:
-            position.min_price = current_price
-            
-        # Update run-up and drawdown
-        self.calculate_position_run_up(position, current_price)
-        self.calculate_position_drawdown(position, current_price)
         
         return round(unrealized_pnl, 2)
 
@@ -851,6 +867,7 @@ class PositionManager:
         # Update run-up and drawdown
         position.run_up = self.calculate_position_run_up(position, current_price)
         position.drawdown = self.calculate_position_drawdown(position, current_price)
+        # Calculate liquidation distance for futures positions
 
         if position.type == PositionType.FUTURES and position.leverage > 1 and position.liquidation_price:
             if position.side == PositionSide.LONG:
@@ -860,7 +877,8 @@ class PositionManager:
             position.liquidation_distance = liquidation_distance
         return position
 
-    def auto_track_position(self, position: Position, current_price: float) -> Dict:
+
+    def auto_track_position(self, position: Position, current_price: float, current_time: int) -> Dict:
         """
         Automatically tracks the status of a trading position and determines the appropriate action 
         based on the current price and position parameters.
@@ -868,6 +886,7 @@ class PositionManager:
         Args:
             position (Position): The trading position to be tracked.
             current_price (float): The current market price of the asset.
+            current_time (int): The current time for tracking purposes.
 
         Returns:
             Dict: A dictionary containing the action taken and the updated position object. 
@@ -890,30 +909,103 @@ class PositionManager:
         self.update_position(position, current_price)
         # Check for stop loss hit
         if self.check_stop_loss_hit(position, current_price):
-            self.close_position(position, current_price)
+            self.close_position(position, current_price,current_time)
             return {"action": "stop_loss", "position": position}
         # Check for take profit hit
         if self.check_take_profit_hit(position, current_price):
-            self.close_position(position, current_price)
+            self.close_position(position, current_price,current_time)
             return {"action": "take_profit", "position": position}
         # Check for liquidation price hit (for futures)
         if position.type == PositionType.FUTURES and position.liquidation_price:
             if (position.side == PositionSide.LONG and current_price <= position.liquidation_price) or \
                (position.side == PositionSide.SHORT and current_price >= position.liquidation_price):
                 position.status = PositionStatus.LIQUIDATED
-                position.closed_time = datetime.now()
+                position.closed_time = current_time
                 position.realized_pnl = -position.position_size / position.leverage  # Full loss of margin
                 return {"action": "liquidation", "position": position}
+        position.total_capital = self.total_capital + position.unrealized_pnl - position.open_fee
         return {"action": "tracking", "position": position}
 
-    def get_position_summary(self, position: Position, current_price: float = None) -> Dict:
+    def auto_track_all_positions_by_symbol(self, symbol: str, current_price: float, current_time: int) -> List[Dict]:
+        """
+        Automatically tracks all positions for a given trading symbol and determines the appropriate action
+        based on the current price and position parameters.
+        Args:
+            symbol (str): The trading symbol to track.
+            current_price (float): The current market price of the asset.
+            current_time (float): The current time for tracking purposes.
+        Returns:
+            List[List]: A list of list information of each position.
+        """
+        # Get all positions for the given symbol
+        positions = [pos for pos in self.get_all_positions() if pos.symbol == symbol]
+        for position in positions:
+            self.auto_track_position(position, current_price, current_time)
+        # return self.get_all_position_summary_by_symbol(symbol)
+    
+    def auto_track_all_positions_by_strategy(self, strategy_id: str, current_price: float, current_time: int) -> List[Dict]:
+        """
+        Automatically tracks all positions for a given strategy ID and determines the appropriate action
+        based on the current price and position parameters.
+        Args:
+            strategy_id (str): The strategy ID to track.
+            current_price (float): The current market price of the asset.
+            current_time (float): The current time for tracking purposes.
+        Returns:
+            List[List]: A list of list information of each position.
+        """
+        # Get all positions for the given strategy ID
+        positions = [pos for pos in self.get_all_positions() if pos.strategy_id == strategy_id]
+        for position in positions:
+            self.auto_track_position(position, current_price, current_time)
+        # return self.get_all_position_summary_by_strategy(strategy_id)
+    
+    def get_all_position_summary_by_strategy(self, strategy_id: str) -> List[List]:
+        """
+        Retrieves a summary of all positions managed by the position manager for a specific symbol.
+        
+        Args:
+            symbol (str): The trading symbol for which to retrieve position summaries.
+            current_price_map (Dict[str, float], optional): A dictionary mapping 
+                symbols to their current prices. If provided, the current price 
+                for each position's symbol will be used in the summary. Defaults to None.
+                
+        Returns:
+            List[List]: A list of dictionaries, where each dictionary contains 
+                the summary of a position for the specified symbol.
+        """
+        summaries = []
+        
+        for _, position in self.positions.items():
+            if position.strategy_id == strategy_id:
+                summary = self.get_position_summary(position)
+                summaries.insert(0,summary) 
+        return summaries
+
+    def get_last_position_by_strategy(self, strategy_id: str) -> Optional[Position]:
+        """
+        Retrieves the last position for a given trading symbol.
+        
+        Args:
+            strategy_id (str): The strategy ID for which to retrieve the last position.
+            
+        Returns:
+            Position: The last position object for the specified strategy, or None if no positions exist.
+        """
+        positions = [pos for pos in self.get_all_positions() if pos.strategy_id == strategy_id]
+        if positions:
+            return positions[-1]
+        return None
+
+
+    def get_position_summary(self, position: Position, current_price: float = None) -> List:
         """
         Generates a summary of the given position, including its details and calculated metrics.
         Args:
             position (Position): The position object containing details about the trade.
             current_price (float, optional): The current market price of the asset. Defaults to None.
         Returns:
-            Dict: A dictionary containing the position summary with the following keys:
+            List: A dictionary containing the position summary with the following keys:
                 - id (str): The unique identifier of the position.
                 - exchange (str): The exchange where the position is held.
                 - symbol (str): The trading symbol of the asset.
@@ -949,13 +1041,13 @@ class PositionManager:
             "id": position.id,
             "exchange": position.exchange,
             "symbol": position.symbol,
-            "side": position.side,
-            "type": position.type,
+            "side": position.side.value,
+            "type": position.type.value,
             "entry_price": position.entry_price,
             "quantity": position.quantity,
             "position_size": position.position_size,
             "leverage": position.leverage,
-            "status": position.status,
+            "status": position.status.value,
             "entry_time": position.entry_time,
             "closed_time": position.closed_time,
             "stop_loss": position.stop_loss,
@@ -964,7 +1056,7 @@ class PositionManager:
             "risk_reward_ratio": position.risk_reward_ratio,
             "open_fee": position.open_fee,
             "close_fee": position.close_fee,
-            "current_price": current_price,
+            "current_price": current_price if current_price else position.current_price,
             "unrealized_pnl": position.unrealized_pnl,
             "unrealized_pnl_percentage": position.unrealized_pnl_percentage,
             "run_up": position.run_up,
@@ -984,9 +1076,44 @@ class PositionManager:
                 "unrealized_pnl": None,
                 "unrealized_pnl_percentage": None,
             })
-            
-        return summary
-
+        # ["","Symbol", "Type", "Status", "Open Time", "Close Time", "Entry Price","Close Price", "Quantity", "Profit","Fee", "Cum.Profit", "Run-up", "Drawdown"]
+        if position.closed_time:
+            close_time = datetime.fromtimestamp(position.closed_time).strftime("%d.%m.%Y-%H:%M:%S")
+        else:
+            close_time = ""
+        if position.realized_pnl:
+            realized_pnl = position.realized_pnl
+        else:
+            realized_pnl = position.unrealized_pnl
+        fee = position.open_fee 
+        if position.close_fee:
+            fee += position.close_fee
+        return ["", position.symbol, position.side.value, position.status.value, datetime.fromtimestamp(position.entry_time).strftime("%d.%m.%Y-%H:%M:%S"), close_time, position.entry_price, position.current_price, position.quantity, realized_pnl, fee, position.total_capital, position.run_up, position.drawdown]
+    
+    def get_all_position_summary_by_symbol(self, symbol: str) -> List[List]:
+        """
+        Retrieves a summary of all positions managed by the position manager for a specific symbol.
+        
+        Args:
+            symbol (str): The trading symbol for which to retrieve position summaries.
+            current_price_map (Dict[str, float], optional): A dictionary mapping 
+                symbols to their current prices. If provided, the current price 
+                for each position's symbol will be used in the summary. Defaults to None.
+                
+        Returns:
+            List[List]: A list of dictionaries, where each dictionary contains 
+                the summary of a position for the specified symbol.
+        """
+        summaries = []
+        
+        for _, position in self.positions.items():
+            if position.symbol == symbol:
+                # Get the current price for the symbol if available
+                summary = self.get_position_summary(position)
+                summaries.insert(0,summary) 
+        return summaries  # Return the summaries without reversing the order
+    
+    
     def get_all_position_summary(self, current_price_map: Dict[str, float] = None) -> List[Dict]:
         """
         Retrieves a summary of all positions managed by the position manager.
@@ -1012,13 +1139,38 @@ class PositionManager:
             summaries.append(summary)
             
         return summaries
+    def clear_all_positions_by_symbol(self, symbol: str) -> None:
+        """
+        Clears all positions for a given trading symbol.
+        Args:
+            symbol (str): The trading symbol for which to clear positions.
+        """
+        # Remove all positions for the given symbol
+        self.positions = {k: v for k, v in self.positions.items() if v.symbol != symbol}
+    def clear_all_positions_by_strategy(self, strategy_id: str) -> None:
+        """
+        Clears all positions for a given trading strategy.
+        Args:
+            strategy_id (str): The trading strategy for which to clear positions.
+        """
+        # Remove all positions for the given strategy
+        self.positions = {k: v for k, v in self.positions.items() if v.strategy_id != strategy_id}
+    def clear_all_positions(self) -> None:
+        """
+        Clears all positions managed by the position manager.
+        """
+        # Remove all positions
+        self.positions = {}
+
 
 # Khởi tạo PositionManager với các tham số của sàn giao dịch
 position_manager = PositionManager(
     maintenance_margin_rate=0.005,
     taker_fee=0.0004,
-    maker_fee=0.0002
+    maker_fee=0.0002,
+    total_capital=10000
 )
+
 
 # Mở một vị thế LONG trên BTC-USDT
 btc_position = position_manager.open_position(
@@ -1036,11 +1188,11 @@ btc_position = position_manager.open_position(
 
 
 # Cập nhật vị thế với giá hiện tại
-position_manager.update_position(btc_position, current_price=51000)
+position_manager.auto_track_position(btc_position, current_price=51000)
 # In ra thông tin vị thế
 position_manager.modify_position_stop_loss(btc_position, new_stop_loss=49000)
 position_manager.modify_position_take_profit(btc_position, new_take_profit=54000)
 print(position_manager.get_position_summary(btc_position))
 
-position_manager.update_position(btc_position, current_price=54000)
+position_manager.auto_track_position(btc_position, current_price=54001)
 print(position_manager.get_position_summary(btc_position))

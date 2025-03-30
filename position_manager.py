@@ -278,7 +278,33 @@ class PositionManager:
         id: str = None,
         strategy_id: str = None,
     ) -> Position:
-        """Open a new position"""
+        """
+        Open a new trading position.
+        Args:
+            exchange (str): The name of the exchange where the position is opened.
+            symbol (str): The trading pair symbol (e.g., "BTC/USDT").
+            entry_price (float): The price at which the position is entered.
+            entry_time (float): The timestamp of when the position is opened.
+            quantity (float): The quantity of the asset being traded.
+            side (PositionSide): The side of the position, either LONG or SHORT.
+            position_type (PositionType): The type of position, either SPOT or FUTURES.
+            leverage (float, optional): The leverage applied to the position. Defaults to 1.0.
+            stop_loss (float, optional): The stop-loss price. Defaults to None.
+            take_profit (float, optional): The take-profit price. Defaults to None.
+            is_taker (bool, optional): Whether the position is opened as a taker. Defaults to True.
+            id (str, optional): A unique identifier for the position. Defaults to None.
+            strategy_id (str, optional): The identifier for the strategy associated with the position. Defaults to None.
+        Returns:
+            Position: The newly created position object.
+        Raises:
+            ValueError: If the side is not LONG or SHORT.
+            ValueError: If the position type is not SPOT or FUTURES.
+        Notes:
+            - For SPOT positions, leverage is always set to 1.0.
+            - Calculates the position size, open fees, and (if applicable) the liquidation price.
+            - If both stop_loss and take_profit are provided, calculates the risk-reward ratio.
+            - Stores the position in the internal positions dictionary.
+        """
         # Validate the side
         if side not in [PositionSide.LONG, PositionSide.SHORT]:
             raise ValueError("Side must be either LONG or SHORT")
@@ -334,6 +360,23 @@ class PositionManager:
         return position
 
     def modify_position_stop_loss(self, position: Position, new_stop_loss: float) -> Position:
+        """
+        Modify the stop loss level of an existing position.
+        Args:
+            position (Position): The position object to modify. Must have a status of OPEN.
+            new_stop_loss (float): The new stop loss level to set. For LONG positions, 
+                                   it must be below the entry price. For SHORT positions, 
+                                   it must be above the entry price.
+        Returns:
+            Position: The updated position object with the modified stop loss level.
+        Raises:
+            ValueError: If the position is not OPEN.
+            ValueError: If the new stop loss level is invalid based on the position side.
+        Notes:
+            - The method updates the stop loss level of the position and recalculates 
+              the risk-reward ratio if a take profit level is set.
+            - The `update_position` method is called to reflect the changes in the position.
+        """
         """Modify the stop loss level of an existing position"""
         # Check if the position is still open
         if position.status != PositionStatus.OPEN:
@@ -357,6 +400,24 @@ class PositionManager:
         return position
 
     def modify_position_take_profit(self, position: Position, new_take_profit: float) -> Position:
+        """
+        Modify the take profit level of an existing position.
+        Args:
+            position (Position): The position object to be modified. It must have a status of OPEN.
+            new_take_profit (float): The new take profit level to set. For LONG positions, it must be 
+                                     greater than the entry price. For SHORT positions, it must be 
+                                     less than the entry price.
+        Returns:
+            Position: The updated position object with the modified take profit level.
+        Raises:
+            ValueError: If the position is not OPEN.
+            ValueError: If the new take profit level is invalid based on the position side 
+                        (e.g., below entry price for LONG or above entry price for SHORT).
+        Notes:
+            - The method updates the position's take profit level and recalculates the risk-reward 
+              ratio if a stop loss is set.
+            - The `update_position` method is called to reflect the changes in the position.
+        """
         """Modify the take profit level of an existing position"""
         # Check if the position is still open
         if position.status != PositionStatus.OPEN:
@@ -378,6 +439,22 @@ class PositionManager:
         return position
 
     def close_position(self, position: Position, exit_price: float, current_time: int, is_taker: bool = True) -> Position:
+        """
+        Close an existing position.
+        Args:
+            position (Position): The position object to be closed. Must have a status of PositionStatus.OPEN.
+            exit_price (float): The price at which the position is being closed.
+            current_time (int): The timestamp at which the position is closed.
+            is_taker (bool, optional): Indicates whether the closing order is a taker order. Defaults to True.
+        Returns:
+            Position: The updated position object with updated status, fees, realized PnL, and other attributes.
+        Raises:
+            ValueError: If the position is not in an open state.
+        Notes:
+            - Updates the position's status to PositionStatus.CLOSED.
+            - Calculates and updates the closing fee, realized PnL, and total capital.
+            - Resets unrealized PnL and unrealized PnL percentage to zero upon closing.
+        """
         """Close an existing position"""
         
         # Check if the position is already closed
@@ -423,6 +500,23 @@ class PositionManager:
         return self.get_position_by_id(position_id).status
 
     def check_stop_loss_hit(self, position: Position, current_price: float) -> bool:
+        """
+        Check if the stop loss level has been hit for a given position.
+        Args:
+            position (Position): The trading position to check. It contains details 
+                such as stop loss level, position side (LONG/SHORT), and status.
+            current_price (float): The current market price of the asset.
+        Returns:
+            bool: True if the stop loss level has been hit and the position is still open, 
+            otherwise False.
+        Behavior:
+            - If the position does not have a stop loss set, returns False.
+            - If the position is not open, returns False.
+            - For LONG positions, returns True if the current price is less than or equal 
+              to the stop loss level.
+            - For SHORT positions, returns True if the current price is greater than or 
+              equal to the stop loss level.
+        """
         """Check if the stop loss level has been hit"""
         # Check if the position has a stop loss set
         if not position.stop_loss:
@@ -441,6 +535,22 @@ class PositionManager:
         return False
 
     def check_take_profit_hit(self, position: Position, current_price: float) -> bool:
+        """
+        Check if the take profit level has been hit for a given position.
+        Args:
+            position (Position): The trading position to check.
+            current_price (float): The current market price of the asset.
+        Returns:
+            bool: True if the take profit level has been hit and the position is still open, 
+                  False otherwise.
+        Notes:
+            - For a LONG position, the take profit is hit if the current price is greater 
+              than or equal to the take profit level.
+            - For a SHORT position, the take profit is hit if the current price is less 
+              than or equal to the take profit level.
+            - If the position does not have a take profit set or is not open, the function 
+              will return False.
+        """
         """Check if the take profit level has been hit"""
         # Check if the position has a take profit set
         if not position.take_profit:
@@ -1177,6 +1287,7 @@ btc_position = position_manager.open_position(
     exchange="binance",
     symbol="BTC-USDT",
     entry_price=50000,
+    entry_time=1633072800,  # Thời gian mở vị thế (timestamp)
     quantity=0.5,
     side=PositionSide.LONG,
     position_type=PositionType.FUTURES,
@@ -1188,11 +1299,11 @@ btc_position = position_manager.open_position(
 
 
 # Cập nhật vị thế với giá hiện tại
-position_manager.auto_track_position(btc_position, current_price=51000)
+# position_manager.auto_track_position(btc_position, current_price=51000)
 # In ra thông tin vị thế
 position_manager.modify_position_stop_loss(btc_position, new_stop_loss=49000)
 position_manager.modify_position_take_profit(btc_position, new_take_profit=54000)
 print(position_manager.get_position_summary(btc_position))
 
-position_manager.auto_track_position(btc_position, current_price=54001)
-print(position_manager.get_position_summary(btc_position))
+# position_manager.auto_track_position(btc_position, current_price=54001)
+# print(position_manager.get_position_summary(btc_position))
